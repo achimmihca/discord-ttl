@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import { deleteOldMessages } from './ttl';
 dotenv.config();
 
-const serverMessageTtlMillis = Number(process.env.DEFAULT_MESSAGE_TTL) * 1000;
+const serverMessageTtlMillis = Number(process.env.DEFAULT_MESSAGE_TTL_MILLIS);
 if (serverMessageTtlMillis <= 0)
 {
   throw new Error("Time to live must be positive but was " + serverMessageTtlMillis)

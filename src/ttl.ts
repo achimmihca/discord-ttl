@@ -1,40 +1,98 @@
-import { Collection, GuildTextBasedChannel, Message, PermissionFlagsBits } from 'discord.js';
+import { Channel, GuildTextBasedChannel, Message, PermissionFlagsBits, TextChannel } from 'discord.js';
 import { client } from './app';
-import { getServerMessageTtlMillis } from './sqlite';
 
-const lastDeletedMessages: Record<string, string> = {};
+const sleepTimeInMillis = 1000;
 
-export async function continuallyRetrieveMessages(): Promise<void> {
-  while (true) {
-    await retrieveMessages();
+export async function deleteOldMessages(
+  timeToLiveInMillis: number,
+  channelNames: string[],
+  isPreviewRun: boolean
+): Promise<void> {
+  const allChannels = Array.from(client.channels.cache.values())
+  const channels = allChannels
+    .filter(channel => !channel.isDMBased()
+      && channel.isTextBased()
+      && channelNames.includes((channel as TextChannel)?.name));
+
+  const timeToLiveInDays = timeToLiveInMillis / 1000 / 60 / 60 / 24;
+  console.log(`Deleting messages of channels: ${channelNames} that are older than ${timeToLiveInMillis} milliseconds (${timeToLiveInDays} days)`);
+  
+  if (isPreviewRun)
+  {
+    console.log(`This is a preview run. Messages will not really be deleted`);
+  }
+  else
+  {
+    console.log(`WARNING: THIS IS NOT A PREVIEW RUN. MESSAGES WILL BE DELETED!`);
+  }
+
+  for (let i = 0; i < channels.length; i++) {
+    const channel = channels[i];
+    await deleteOldMessagesInChannel(timeToLiveInMillis, channel, isPreviewRun);
+    
+    await sleep(sleepTimeInMillis);
   }
 }
 
-async function retrieveMessages(): Promise<void> {
-  for (const channel of client.channels.cache.values()) {
-    if (channel.isDMBased() || !channel.isTextBased()) {
-      continue;
-    }
-    if (!canGetAndDeleteMessages(channel)) {
-      continue;
-    }
-    if (!lastDeletedMessages[channel.id]) {
-      lastDeletedMessages[channel.id] = channel.id;
-    }
-    try {
-      const guildId: string = channel.guildId;
-      const messages: Collection<string, Message<boolean>> = await channel.messages.fetch({
-        after: lastDeletedMessages[channel.id],
-        limit: 100,
-      });
-      const awaitedPromises = await handleDeletesForNonBulkDeletableMessages(guildId, channel.id, messages);
-      if (awaitedPromises.length === 0) {
-        await handleDeletesForBulkDeletableMessages(guildId, channel, messages);
-      }
-    } catch (err) {
-      console.error(err);
-    }
+async function sleep(ms: number) {
+    console.log("sleeping " + ms + " milliseconds")
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function deleteOldMessagesInChannel(
+  timeToLiveInMillis: number,
+  channel: Channel,
+  isPreviewRun: boolean
+): Promise<void> {
+  if (channel.isDMBased()) {
+    console.error("Cannot delete old messages of DM channel " + channel.id);
+    return;
   }
+  
+  if (!channel.isTextBased()) {
+    console.error("Cannot delete old messages of non-text-based channel " + channel.id);
+    return;
+  }
+
+  if (!canGetAndDeleteMessages(channel)) {
+    return;
+  }
+
+  const textChannel = channel as TextChannel;
+  if (!textChannel)
+  {
+    console.error("Failed to convert channel to TextChannel: " + channel.name);
+    return;
+  }
+
+  console.log(`Deleting old messages in channel ${channel.name}`)
+
+  const messages = await getAllMessagesOfChannel(textChannel);
+  console.log(`Found ${messages.length} messages in channel ${channel.name}`)
+
+  const oldMessages = messages
+    .filter ((message : Message) => isMessageOlderThan(message, timeToLiveInMillis));
+  console.log(`Found ${oldMessages.length} messages older than ${timeToLiveInMillis} millis in channel ${channel.name}`)
+  
+  const oldMessagesOldestFirst = oldMessages.reverse()
+
+  // Discord API only allows to bulk-delete messages that are younger than 14 days.
+  const bulkDeletableOldMessages = oldMessagesOldestFirst
+  .filter((message: Message) => canMessageBeBulkDeleted(message));
+  
+  const nonBulkDeletableOldMessages = oldMessagesOldestFirst
+  .filter((message: Message) => !canMessageBeBulkDeleted(message));
+
+  if (nonBulkDeletableOldMessages.length > 0)
+  {
+    await doDeleteNonBulkDeletableMessages(textChannel, nonBulkDeletableOldMessages, isPreviewRun);
+  }
+
+  if (bulkDeletableOldMessages.length > 0)
+  {
+    await doDeletesBulkDeletableMessages(textChannel, bulkDeletableOldMessages, isPreviewRun);
+  }
+  await sleep(sleepTimeInMillis);
 }
 
 function canGetAndDeleteMessages(channel: GuildTextBasedChannel): boolean {
@@ -42,48 +100,69 @@ function canGetAndDeleteMessages(channel: GuildTextBasedChannel): boolean {
   if (!me) {
     return false;
   }
+
   const currentPerms = me.permissionsIn(channel);
-  if (
-    !currentPerms.has(PermissionFlagsBits.ViewChannel) ||
-    !currentPerms.has(PermissionFlagsBits.ReadMessageHistory) ||
-    !currentPerms.has(PermissionFlagsBits.ManageMessages)
-  ) {
-    return false;
+
+  const errorMessages: string[] = []
+  if (!currentPerms.has(PermissionFlagsBits.ViewChannel))
+  {
+    errorMessages.push("Missing permission PermissionFlagsBits.ViewChannel for channel " + channel.name);
   }
+
+  if (!currentPerms.has(PermissionFlagsBits.ReadMessageHistory))
+  {
+    errorMessages.push("Missing permission PermissionFlagsBits.ReadMessageHistory for channel " + channel.name);
+  }
+
+  if (!currentPerms.has(PermissionFlagsBits.ManageMessages))
+  {
+    errorMessages.push("Missing permission PermissionFlagsBits.ManageMessages for channel " + channel.name);
+  }
+
   // Text-in-voice channels require Connect permissions, too (apparently)
   if (channel.isVoiceBased() && !currentPerms.has(PermissionFlagsBits.Connect)) {
+      errorMessages.push("Missing permission PermissionFlagsBits.Connect for voice channel " + channel.name);
+  }
+  
+  if (errorMessages.length > 0)
+  {
+    errorMessages.forEach(errorMessage => console.error(errorMessage))
     return false;
   }
+
   return true;
 }
 
-function isMessageOlderThanTtl(serverId: string, message: { createdAt: { getTime: () => number } }): boolean {
-  return message.createdAt.getTime() < Date.now() - getServerMessageTtlMillis(serverId);
+function canMessageBeBulkDeleted(message: Message): boolean {
+  // Discord's bulk deletion threshold is 14 days
+  const bulkDeletionThresholdInMillis: number = 1000 * 60 * 60 * 24 * 14;
+  return !isMessageOlderThan(message, bulkDeletionThresholdInMillis)
 }
 
-function canMessageBeBulkDeleted(message: { createdAt: { getTime: () => number } }): boolean {
-  const bulkDeletionThresholdInMillis: number = 1000 * 60 * 60 * 24 * 14; // 14 days (Discord's bulk deletion threshold)
-  return message.createdAt.getTime() > Date.now() - bulkDeletionThresholdInMillis;
+function isMessageOlderThan(message: Message, timeInMillis: number)
+{
+  const messageAgeInMillis = Date.now() - message.createdAt.getTime();
+  return messageAgeInMillis > timeInMillis;
 }
 
 /**
  * Messages older than Discord's bulk message deletion age limit cannot be
  * bulk deleted, so this method collects them and deletes them one-by-one.
  */
-async function handleDeletesForNonBulkDeletableMessages(
-  guildId: string,
-  channelId: string,
-  messages: Collection<string, Message<boolean>>,
+async function doDeleteNonBulkDeletableMessages(
+  channel: TextChannel,
+  messages: Message[],
+  isPreviewRun: boolean
 ): Promise<void[]> {
   return Promise.all(
     messages
-      .filter(
-        (message: { createdAt: { getTime: () => number } }) =>
-          isMessageOlderThanTtl(guildId, message) && !canMessageBeBulkDeleted(message),
-      )
-      .map(async (message: { delete: () => any; id: string }) => {
-        await message.delete();
-        lastDeletedMessages[channelId] = message.id;
+      .map(async (message: Message) => {
+        console.log(`Deleting message ${messageToString(message)} from channel ${channel.name}`)
+        
+        if (!isPreviewRun)
+        {
+          await message.delete();
+        }
       }),
   );
 }
@@ -92,28 +171,71 @@ async function handleDeletesForNonBulkDeletableMessages(
  * Messages younger than Discord's bulk message deletion age limit can be
  * bulk deleted, so this method utilizes that feature to send batched delete requests.
  */
-async function handleDeletesForBulkDeletableMessages(
-  guildId: string,
-  channel: GuildTextBasedChannel,
-  messages: Collection<string, Message<boolean>>,
-): Promise<void | Collection<string, Message<boolean>>> {
-  const messagesToDelete = messages.filter(
-    (message: { createdAt: { getTime: () => number } }) =>
-      isMessageOlderThanTtl(guildId, message) && canMessageBeBulkDeleted(message),
-  );
-  if (messagesToDelete.size === 0) {
+async function doDeletesBulkDeletableMessages(
+  channel: TextChannel,
+  messages: Message[],
+  isPreviewRun: boolean
+): Promise<any> {
+  if (messages.length === 0) {
     return;
   }
+
   // https://discord.js.org/#/docs/main/stable/class/BaseGuildTextChannel?scrollTo=bulkDelete
-  return channel.bulkDelete(messagesToDelete).then(deletedMessages => {
-    let newestMessageId = '0';
-    deletedMessages.forEach((_message: any, snowflake: string) => {
-      if (BigInt(newestMessageId) < BigInt(snowflake)) {
-        newestMessageId = snowflake;
-      }
-    });
-    if (!lastDeletedMessages[channel.id] || BigInt(lastDeletedMessages[channel.id]) < BigInt(newestMessageId)) {
-      lastDeletedMessages[channel.id] = newestMessageId;
+  console.log(`Bulk deleting ${messages.length} messages from channel ${channel.name}: \n    ${messages.map(m => messageToString(m)).join('\n    ')}`)
+
+  if (!isPreviewRun)
+  {
+    return channel
+      .bulkDelete(messages);
+  }
+}
+
+function messageToString(message: Message): string
+{
+  return `${message.id} by ${message.author.username} at ${message.createdAt.toISOString()}`
+}
+
+function getLastElement<T>(arr: Array<T>)
+{
+  return arr.slice(-1)[0]
+}
+
+async function getAllMessagesOfChannel(channel: TextChannel) {
+  console.log(`Fetching all messages in channel ${channel.name}`)
+  
+  const messages: Message[] = [];
+
+  // Create message pointer
+  let message = await channel.messages
+    .fetch({ limit: 1 })
+    .then(messagePage => (messagePage.size === 1 ? messagePage.at(0) : null));
+
+  // Collect messages in batches
+  const maxFetchMessageCount = 100;
+  const seenBeforeValues: string[] = []
+  while (message) {
+    const before = message.id
+    if (seenBeforeValues.includes(before))
+    {
+      throw new Error(`Attempt to request the same messages twice, namely before ${before}`)
     }
-  });
+    seenBeforeValues.push(before);
+
+    console.log(`Fetching messages of channel ${channel.name} before ${before}, limit = ${maxFetchMessageCount}`)
+    await channel.messages
+      .fetch({
+        limit: maxFetchMessageCount,
+        before: before,
+      })
+      .then(messagePage => {
+        messagePage.forEach(msg => messages.push(msg));
+
+        // Update our message pointer to be the last message on the page of messages
+        message = 0 < messagePage.size
+          ? messagePage.at(messagePage.size - 1)
+          : null;
+      });
+  }
+
+  return messages;
 }

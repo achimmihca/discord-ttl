@@ -4,3 +4,4 @@
 yarn-error.log
 *.db
 /data/
+log.txt

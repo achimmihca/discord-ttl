@@ -26,8 +26,7 @@ export async function deleteOldMessages(
     console.log(`WARNING: THIS IS NOT A PREVIEW RUN. MESSAGES WILL BE DELETED!`);
   }
 
-  for (let i = 0; i < channels.length; i++) {
-    const channel = channels[i];
+  for (const channel of channels) {
     await deleteOldMessagesInChannel(timeToLiveInMillis, channel, isPreviewRun);
     
     await sleep(sleepTimeInMillis);
@@ -71,7 +70,7 @@ async function deleteOldMessagesInChannel(
   console.log(`Found ${messages.length} messages in channel ${channel.name}`)
 
   const oldMessages = messages
-    .filter ((message : Message) => isMessageOlderThan(message, timeToLiveInMillis));
+    .filter ((message : Message) => isMessageOlderThanMillis(message, timeToLiveInMillis));
   console.log(`Found ${oldMessages.length} messages older than ${timeToLiveInMillis} millis in channel ${channel.name}`)
   
   const oldMessagesOldestFirst = oldMessages.reverse()
@@ -136,10 +135,10 @@ function canGetAndDeleteMessages(channel: GuildTextBasedChannel): boolean {
 function canMessageBeBulkDeleted(message: Message): boolean {
   // Discord's bulk deletion threshold is 14 days
   const bulkDeletionThresholdInMillis: number = 1000 * 60 * 60 * 24 * 14;
-  return !isMessageOlderThan(message, bulkDeletionThresholdInMillis)
+  return !isMessageOlderThanMillis(message, bulkDeletionThresholdInMillis)
 }
 
-function isMessageOlderThan(message: Message, timeInMillis: number)
+function isMessageOlderThanMillis(message: Message, timeInMillis: number)
 {
   const messageAgeInMillis = Date.now() - message.createdAt.getTime();
   return messageAgeInMillis > timeInMillis;
@@ -153,18 +152,20 @@ async function doDeleteNonBulkDeletableMessages(
   channel: TextChannel,
   messages: Message[],
   isPreviewRun: boolean
-): Promise<void[]> {
-  return Promise.all(
-    messages
-      .map(async (message: Message) => {
-        console.log(`Deleting message ${messageToString(message)} from channel ${channel.name}`)
-        
-        if (!isPreviewRun)
-        {
-          await message.delete();
-        }
-      }),
-  );
+): Promise<void> {
+  let deletedMessageCount = 0;
+  for (const message of messages) {
+    if (message.deletable)
+    {
+      console.log(`${new Date().toISOString()} - Deleting message (${deletedMessageCount + 1} / ${messages.length}) ${messageToString(message)} from channel ${channel.name}`)
+      await message.delete()
+      deletedMessageCount++;
+    }
+    else
+    {
+      console.log(`Not deletable: message ${messageToString(message)} from channel ${channel.name}`)
+    }
+  }
 }
 
 /**
@@ -175,7 +176,7 @@ async function doDeletesBulkDeletableMessages(
   channel: TextChannel,
   messages: Message[],
   isPreviewRun: boolean
-): Promise<any> {
+): Promise<void> {
   if (messages.length === 0) {
     return;
   }
@@ -185,7 +186,7 @@ async function doDeletesBulkDeletableMessages(
 
   if (!isPreviewRun)
   {
-    return channel
+    await channel
       .bulkDelete(messages);
   }
 }
@@ -195,12 +196,9 @@ function messageToString(message: Message): string
   return `${message.id} by ${message.author.username} at ${message.createdAt.toISOString()}`
 }
 
-function getLastElement<T>(arr: Array<T>)
-{
-  return arr.slice(-1)[0]
-}
-
-async function getAllMessagesOfChannel(channel: TextChannel) {
+async function getAllMessagesOfChannel(
+  channel: TextChannel
+) {
   console.log(`Fetching all messages in channel ${channel.name}`)
   
   const messages: Message[] = [];
